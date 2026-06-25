@@ -250,6 +250,15 @@ _MODEL_NOT_FOUND_PATTERNS = [
     "no such model",
     "unknown model",
     "unsupported model",
+    # LM Studio: the model was unloaded/ejected at runtime (e.g. JIT off, or
+    # manual eject). Non-retryable — re-firing the same completion just makes
+    # LM Studio JIT-reload the model and burn tokens in a loop. Surface one
+    # clean error instead. Transient network errors are handled elsewhere.
+    "model unloaded",
+    "model not loaded",
+    "no model loaded",
+    "no models loaded",
+    "no chat-capable models",
 ]
 
 # Request-validation patterns — the request is malformed and will fail
