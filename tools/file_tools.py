@@ -159,6 +159,65 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path:
     return (_resolve_base_dir(task_id) / p).resolve()
 
 
+def _vault_jail_root() -> Path | None:
+    """The per-session vault root the file tools are confined to, or None.
+
+    Returns a root ONLY when a caller explicitly pinned one for this context
+    (e.g. folio sends ``vault_root`` on /v1/responses → the gateway pins it via
+    ``set_session_cwd``). When nothing is pinned (CLI, cron, Council), returns
+    None and the jail does not engage — those flows keep their prior behaviour.
+    The root is fully resolved (symlinks followed) so the containment check is
+    sound.
+    """
+    try:
+        from agent.runtime_cwd import session_cwd_override
+        override = session_cwd_override()
+    except Exception:
+        return None
+    if not override:
+        return None
+    try:
+        return Path(override).expanduser().resolve()
+    except Exception:
+        # A pinned-but-unresolvable root must FAIL CLOSED, not silently open the
+        # jail. Return a sentinel no real path is under so every access is denied.
+        return Path("/__hermes_vault_jail_unresolvable__")
+
+
+def _check_vault_jail(filepath: str, task_id: str = "default") -> str | None:
+    """Deny access to paths outside the active vault root.
+
+    Capability-removal boundary (not a blacklist): when a session vault root is
+    pinned, read/write/patch may only touch paths INSIDE it. Absolute paths,
+    ``~`` paths, and ``..``-escapes from relative paths all resolve through the
+    same canonical ``_resolve_path_for_task`` (which calls ``.resolve()``, so a
+    symlink pointing out of the vault is caught at its real target). Returns an
+    error string when the path escapes the vault, else None.
+
+    Mirrors the ``_check_sensitive_path`` guard shape so it can sit at the top of
+    each file tool — crucially BEFORE ``write_file_tool``'s resolver-fallback,
+    which would otherwise swallow a resolver-raised denial and write anyway.
+    """
+    root = _vault_jail_root()
+    if root is None:
+        return None  # no pinned vault root → unchanged behaviour (CLI/cron/Council)
+    try:
+        resolved = _resolve_path_for_task(filepath, task_id)
+    except Exception:
+        # Can't resolve — let the downstream tool surface its own error rather
+        # than masking it; resolution failure is not an escape.
+        return None
+    try:
+        resolved.relative_to(root)
+        return None  # inside the active vault — allowed
+    except ValueError:
+        return (
+            f"Access denied: {filepath!r} resolves to {str(resolved)!r}, which is "
+            f"OUTSIDE the active vault ({str(root)!r}). This session may only read "
+            f"or write files inside the active vault. Use a path under {str(root)}."
+        )
+
+
 def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "default") -> str | None:
     """Warn when a relative path resolved OUTSIDE the task's workspace root.
 
@@ -694,6 +753,13 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
     try:
         offset, limit = normalize_read_pagination(offset, limit)
 
+        # ── Vault jail ────────────────────────────────────────────────
+        # If a per-session vault root is pinned, refuse reads outside it
+        # (exfiltration boundary). No-op for CLI/cron/Council.
+        jail_err = _check_vault_jail(path, task_id)
+        if jail_err:
+            return json.dumps({"error": jail_err}, ensure_ascii=False)
+
         # ── Device path guard ─────────────────────────────────────────
         # Block paths that would hang the process (infinite output,
         # blocking on input).  Pure path check — no I/O.
@@ -1050,6 +1116,14 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     Pass ``True`` after explicit user direction — same shape as ``force``
     on the terminal tool.
     """
+    # ── Vault jail (write) ────────────────────────────────────────────
+    # MUST run before the try-block below: its resolver-fallback (catch →
+    # _resolved=None → legacy write with the raw path) would otherwise swallow a
+    # resolver-raised denial and write anyway. Writing outside the vault is a
+    # data-integrity boundary — never laxer than read. No-op for CLI/cron.
+    jail_err = _check_vault_jail(path, task_id)
+    if jail_err:
+        return tool_error(jail_err)
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -1152,6 +1226,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 )
             _paths_to_check.append(v4a_path)
     for _p in _paths_to_check:
+        jail_err = _check_vault_jail(_p, task_id)
+        if jail_err:
+            return tool_error(jail_err)
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)

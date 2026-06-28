@@ -36,6 +36,18 @@ def _session_cwd_override() -> str:
     return str(value).strip()
 
 
+def session_cwd_override() -> str:
+    """Public: the cwd EXPLICITLY pinned for this context, or "" if none.
+
+    Unlike :func:`resolve_agent_cwd`, this does NOT fall back to
+    ``TERMINAL_CWD`` or the process cwd. Security boundaries (e.g. the
+    file-tool vault jail) must engage ONLY when a per-session root was
+    deliberately pinned by the caller — never against the gateway's global
+    install dir, which would wrongly jail CLI/cron/Council file access.
+    """
+    return _session_cwd_override()
+
+
 def resolve_agent_cwd() -> Path:
     override = _session_cwd_override()
     if override:

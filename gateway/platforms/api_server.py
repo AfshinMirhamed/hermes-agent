@@ -2773,6 +2773,14 @@ class APIServerAdapter(BasePlatformAdapter):
         if raw_input is None:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
 
+        # Optional per-request vault root: confines the agent's file tools to
+        # this directory for the duration of the request (see _run_agent). The
+        # caller (e.g. folio) sends the ACTIVE vault so a demo session cannot
+        # read or write the private vault. Absent → no jail (CLI/Council).
+        vault_root = body.get("vault_root")
+        if vault_root is not None and not isinstance(vault_root, str):
+            return web.json_response(_openai_error("'vault_root' must be a string"), status=400)
+
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
         conversation = body.get("conversation")
@@ -2912,6 +2920,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                vault_root=vault_root,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -2945,6 +2954,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                vault_root=vault_root,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -3447,6 +3457,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        vault_root: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -3462,35 +3473,51 @@ class APIServerAdapter(BasePlatformAdapter):
         loop = asyncio.get_running_loop()
 
         def _run():
-            agent = self._create_agent(
-                ephemeral_system_prompt=ephemeral_system_prompt,
-                session_id=session_id,
-                stream_delta_callback=stream_delta_callback,
-                tool_progress_callback=tool_progress_callback,
-                tool_start_callback=tool_start_callback,
-                tool_complete_callback=tool_complete_callback,
-                gateway_session_key=gateway_session_key,
-            )
-            if agent_ref is not None:
-                agent_ref[0] = agent
-            effective_task_id = session_id or str(uuid.uuid4())
-            result = agent.run_conversation(
-                user_message=user_message,
-                conversation_history=conversation_history,
-                task_id=effective_task_id,
-            )
-            usage = {
-                "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-            }
-            # Include the effective session ID in the result so callers
-            # (e.g. X-Hermes-Session-Id header) can track compression-
-            # triggered session rotations. (#16938)
-            _eff_sid = getattr(agent, "session_id", session_id)
-            if isinstance(_eff_sid, str) and _eff_sid:
-                result["session_id"] = _eff_sid
-            return result, usage
+            # Pin the per-request vault root for THIS worker thread's context so
+            # the file tools' jail (tools/file_tools._check_vault_jail) confines
+            # reads/writes to it. It MUST be set inside the thread:
+            # loop.run_in_executor does NOT copy the async handler's contextvars
+            # to the worker. Mirrors the /v1/runs path, which sets its session
+            # vars inside its own thread for the same reason. Cleared in finally
+            # so a pooled thread doesn't leak the root into a later request.
+            _pin_vault = bool(vault_root)
+            if _pin_vault:
+                from agent.runtime_cwd import set_session_cwd
+                set_session_cwd(vault_root)
+            try:
+                agent = self._create_agent(
+                    ephemeral_system_prompt=ephemeral_system_prompt,
+                    session_id=session_id,
+                    stream_delta_callback=stream_delta_callback,
+                    tool_progress_callback=tool_progress_callback,
+                    tool_start_callback=tool_start_callback,
+                    tool_complete_callback=tool_complete_callback,
+                    gateway_session_key=gateway_session_key,
+                )
+                if agent_ref is not None:
+                    agent_ref[0] = agent
+                effective_task_id = session_id or str(uuid.uuid4())
+                result = agent.run_conversation(
+                    user_message=user_message,
+                    conversation_history=conversation_history,
+                    task_id=effective_task_id,
+                )
+                usage = {
+                    "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                    "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                    "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                }
+                # Include the effective session ID in the result so callers
+                # (e.g. X-Hermes-Session-Id header) can track compression-
+                # triggered session rotations. (#16938)
+                _eff_sid = getattr(agent, "session_id", session_id)
+                if isinstance(_eff_sid, str) and _eff_sid:
+                    result["session_id"] = _eff_sid
+                return result, usage
+            finally:
+                if _pin_vault:
+                    from agent.runtime_cwd import clear_session_cwd
+                    clear_session_cwd()
 
         return await loop.run_in_executor(None, _run)
 
